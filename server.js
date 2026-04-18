@@ -5,6 +5,29 @@ const app = express();
 app.use(express.json());
 
 // ==============================
+// API KEY (SEGURANÇA)
+// ==============================
+const API_KEY = process.env.BRIDGE_API_KEY;
+
+function autenticar(req, res, next) {
+  const key = req.headers["x-api-key"];
+
+  if (!API_KEY) {
+    return res.status(500).json({ error: "API KEY não configurada no servidor" });
+  }
+
+  if (!key) {
+    return res.status(401).json({ error: "API KEY não enviada" });
+  }
+
+  if (key !== API_KEY) {
+    return res.status(403).json({ error: "API KEY inválida" });
+  }
+
+  next();
+}
+
+// ==============================
 // CONFIG SQL SERVER
 // ==============================
 const config = {
@@ -23,73 +46,125 @@ const config = {
   },
 };
 
+// ==============================
+// POOL GLOBAL
+// ==============================
 let pool;
 
 async function getPool() {
   if (!pool) {
-    console.log("[DB] conectando...");
     pool = await sql.connect(config);
-    console.log("[DB] conectado");
   }
   return pool;
 }
 
 // ==============================
-// HEALTH
+// ROTAS LIVRES (SEM AUTH)
 // ==============================
 app.get("/", (req, res) => {
   res.send("API Bridge rodando 🚀");
 });
 
-app.get("/ping", (req, res) => {
-  res.json({ status: "alive" });
-});
-
-// ==============================
-// TESTE BANCO
-// ==============================
 app.get("/teste-db", async (req, res) => {
   try {
-    const p = await getPool();
-    const result = await p.request().query("SELECT GETDATE() AS data");
+    const pool = await getPool();
+    const result = await pool.request().query("SELECT GETDATE() AS data");
     res.json(result.recordset);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
 // ==============================
-// 🔥 QUERY DINÂMICA (ESSENCIAL)
+// LISTAR VIEWS (PROTEGIDO)
 // ==============================
-app.post("/api/query", async (req, res) => {
-  const { query } = req.body;
-
-  if (!query) {
-    return res.status(400).json({ error: "QUERY_REQUIRED" });
-  }
-
+app.get("/views", autenticar, async (req, res) => {
   try {
-    const p = await getPool();
-    const result = await p.request().query(query);
+    const pool = await getPool();
 
-    res.json({
-      success: true,
-      data: result.recordset,
-    });
+    const result = await pool.request().query(`
+      SELECT TABLE_NAME
+      FROM INFORMATION_SCHEMA.VIEWS
+      ORDER BY TABLE_NAME
+    `);
 
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({
-      error: "QUERY_FAILED",
-      message: err.message,
-    });
+    res.json(result.recordset);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
 // ==============================
-// START (CORRETO NO RAILWAY)
+// CONSULTAR VIEW DINÂMICA
 // ==============================
-const PORT = process.env.PORT;
+app.get("/view/:nome", autenticar, async (req, res) => {
+  try {
+    const pool = await getPool();
+
+    const nomeView = req.params.nome;
+
+    const limit = parseInt(req.query.limit) || 100;
+    const offset = parseInt(req.query.offset) || 0;
+
+    // filtros dinâmicos
+    const filtros = Object.keys(req.query)
+      .filter((k) => !["limit", "offset"].includes(k))
+      .map((k) => `${k} = @${k}`);
+
+    let where = "";
+    if (filtros.length > 0) {
+      where = "WHERE " + filtros.join(" AND ");
+    }
+
+    const request = pool.request();
+
+    Object.keys(req.query).forEach((key) => {
+      if (!["limit", "offset"].includes(key)) {
+        request.input(key, req.query[key]);
+      }
+    });
+
+    const query = `
+      SELECT *
+      FROM ${nomeView}
+      ${where}
+      ORDER BY 1
+      OFFSET ${offset} ROWS
+      FETCH NEXT ${limit} ROWS ONLY
+    `;
+
+    const result = await request.query(query);
+
+    res.json(result.recordset);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==============================
+// QUERY LIVRE (SOMENTE TESTE)
+// ==============================
+app.post("/query", autenticar, async (req, res) => {
+  try {
+    const { query } = req.body;
+
+    if (!query) {
+      return res.status(400).json({ error: "Query não enviada" });
+    }
+
+    const pool = await getPool();
+    const result = await pool.request().query(query);
+
+    res.json(result.recordset);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==============================
+// START SERVER
+// ==============================
+const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Servidor rodando na porta " + PORT);
