@@ -1,120 +1,139 @@
-require("dotenv").config();
+/**
+ * SQL Server Bridge — HTTP API segura para consumo por Supabase Edge Functions
+ *
+ * Endpoints:
+ *   GET  /health                → status
+ *   POST /api/bi/query          → executa SELECT em view permitida
+ *
+ * Autenticação:
+ *   Header: x-api-key: <BRIDGE_API_KEY>
+ *
+ * Variáveis de ambiente (.env):
+ *   PORT=3000
+ *   BRIDGE_API_KEY=<chave-forte-aleatoria>
+ *   SQLSERVER_HOST=<host>
+ *   SQLSERVER_PORT=1433
+ *   SQLSERVER_DB=<database>
+ *   SQLSERVER_USER=<user>
+ *   SQLSERVER_PASSWORD=<password>
+ *   SQLSERVER_ENCRYPT=true
+ *   SQLSERVER_TRUST_CERT=true
+ */
 
+require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const sql = require("mssql");
 
-const app = express();
+const PORT = parseInt(process.env.PORT || "3000", 10);
+const API_KEY = process.env.BRIDGE_API_KEY;
 
-// ==============================
-// MIDDLEWARES
-// ==============================
-app.use(cors());
-app.use(express.json());
+if (!API_KEY) {
+  console.error("[FATAL] BRIDGE_API_KEY não configurado no .env");
+  process.exit(1);
+}
 
-// ==============================
-// CONFIG SQL SERVER
-// ==============================
-const dbConfig = {
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  server: process.env.DB_SERVER,
-  database: process.env.DB_NAME,
+const sqlConfig = {
+  user: process.env.SQLSERVER_USER,
+  password: process.env.SQLSERVER_PASSWORD,
+  server: process.env.SQLSERVER_HOST,
+  port: parseInt(process.env.SQLSERVER_PORT || "1433", 10),
+  database: process.env.SQLSERVER_DB,
+  pool: { max: 10, min: 0, idleTimeoutMillis: 30000 },
   options: {
-    encrypt: false,
-    trustServerCertificate: true,
+    encrypt: process.env.SQLSERVER_ENCRYPT !== "false",
+    trustServerCertificate: process.env.SQLSERVER_TRUST_CERT !== "false",
+    enableArithAbort: true,
   },
-  pool: {
-    max: 10,
-    min: 0,
-    idleTimeoutMillis: 30000,
-  },
+  connectionTimeout: 30000,
+  requestTimeout: 60000,
 };
 
 let pool;
-
-// ==============================
-// CONEXÃO COM BANCO
-// ==============================
-async function connectDB() {
-  try {
-    pool = await sql.connect(dbConfig);
-    console.log("✅ Conectado ao SQL Server");
-  } catch (err) {
-    console.error("❌ Erro ao conectar no banco:", err);
-    process.exit(1);
+async function getPool() {
+  if (!pool) {
+    pool = await sql.connect(sqlConfig);
+    console.log("[DB] Pool SQL Server conectado");
   }
+  return pool;
 }
 
-// ==============================
-// AUTH API KEY
-// ==============================
-function autenticar(req, res, next) {
-  const apiKey = req.headers["x-api-key"];
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "256kb" }));
 
-  if (!apiKey || apiKey !== process.env.API_KEY) {
-    return res.status(401).json({
-      error: "Não autorizado",
-    });
+// Middleware de autenticação
+function requireApiKey(req, res, next) {
+  const key = req.header("x-api-key");
+  if (!key || key !== API_KEY) {
+    return res.status(401).json({ error: "UNAUTHORIZED" });
   }
-
   next();
 }
 
-// ==============================
-// HEALTH CHECK
-// ==============================
-app.get("/", (req, res) => {
-  res.send("🚀 Bridge API rodando");
+// Whitelist de prefixos / nomes permitidos (espelho do edge bi-query)
+const ALLOWED_PREFIXES = ["vw_", "v_bi_", "v_gold_"];
+const MAX_LIMIT = 5000;
+
+function isViewAllowed(viewName) {
+  if (typeof viewName !== "string") return false;
+  if (!/^[A-Za-z0-9_]{1,128}$/.test(viewName)) return false;
+  return ALLOWED_PREFIXES.some((p) => viewName.startsWith(p));
+}
+
+// Health check
+app.get("/health", async (_req, res) => {
+  try {
+    const p = await getPool();
+    const r = await p.request().query("SELECT 1 AS ok");
+    res.json({ status: "ok", db: r.recordset[0].ok === 1 });
+  } catch (err) {
+    res.status(500).json({ status: "error", error: err.message });
+  }
 });
 
-// ==============================
-// LISTA DE VIEWS PERMITIDAS
-// ==============================
-const allowedViews = [
-  "vw_bi_frota",
-  "vw_bi_contratos",
-  "vw_bi_multas",
-];
+// Query principal
+app.post("/api/bi/query", requireApiKey, async (req, res) => {
+  const { view, limit } = req.body || {};
 
-// ==============================
-// ENDPOINT DINÂMICO DE VIEWS
-// ==============================
-app.get("/views/:viewName", autenticar, async (req, res) => {
-  const { viewName } = req.params;
-
-  // segurança contra injection
-  if (!allowedViews.includes(viewName)) {
-    return res.status(403).json({
-      error: "View não permitida",
-    });
+  if (!isViewAllowed(view)) {
+    return res.status(403).json({ error: "VIEW_NOT_ALLOWED", view });
   }
 
+  const safeLimit = Math.min(
+    Math.max(parseInt(limit, 10) || 1000, 1),
+    MAX_LIMIT,
+  );
+
   try {
-    const result = await pool
-      .request()
-      .query(`SELECT TOP 1000 * FROM ${viewName}`);
+    const p = await getPool();
+    const query = `SELECT TOP (${safeLimit}) * FROM [${view}]`;
+    const start = Date.now();
+    const result = await p.request().query(query);
+    const duration = Date.now() - start;
+
+    console.log(
+      `[QUERY] view=${view} rows=${result.recordset.length} duration=${duration}ms`,
+    );
 
     res.json({
       success: true,
+      view,
       data: result.recordset,
-      total: result.recordset.length,
+      meta: { count: result.recordset.length, duration_ms: duration },
     });
   } catch (err) {
-    console.error("Erro na query:", err);
-
-    res.status(500).json({
-      error: "Erro ao consultar a view",
-      details: err.message,
-    });
+    console.error(`[ERROR] view=${view}`, err.message);
+    res.status(500).json({ error: "QUERY_FAILED", message: err.message });
   }
 });
 
-// ==============================
-// START SERVER
-// ==============================
-const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`[SERVER] SQL Server Bridge rodando na porta ${PORT}`);
+});
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
+// Encerramento gracioso
+process.on("SIGTERM", async () => {
+  if (pool) await pool.close();
+  process.exit(0);
 });
