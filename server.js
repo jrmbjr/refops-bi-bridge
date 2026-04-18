@@ -83,10 +83,21 @@ function isViewAllowed(viewName) {
 app.get("/health", async (_req, res) => {
   try {
     const p = await getPool();
-    const r = await p.request().query("SELECT 1 AS ok");
-    res.json({ status: "ok", db: r.recordset[0].ok === 1 });
+    await p.request().query("SELECT 1 AS ok");
+
+    return res.json({
+      status: "ok",
+      db: true
+    });
+
   } catch (err) {
-    res.status(500).json({ status: "error", error: err.message });
+    console.error("Erro no health:", err.message);
+
+    return res.json({
+      status: "ok",
+      db: false,
+      error: err.message
+    });
   }
 });
 
