@@ -1,36 +1,21 @@
 /**
  * SQL Server Bridge — HTTP API segura para consumo por Supabase Edge Functions
- *
- * Endpoints:
- *   GET  /health                → status
- *   POST /api/bi/query          → executa SELECT em view permitida
- *
- * Autenticação:
- *   Header: x-api-key: <BRIDGE_API_KEY>
- *
- * Variáveis de ambiente (.env):
- *   PORT=3000
- *   BRIDGE_API_KEY=<chave-forte-aleatoria>
- *   SQLSERVER_HOST=<host>
- *   SQLSERVER_PORT=1433
- *   SQLSERVER_DB=<database>
- *   SQLSERVER_USER=<user>
- *   SQLSERVER_PASSWORD=<password>
- *   SQLSERVER_ENCRYPT=true
- *   SQLSERVER_TRUST_CERT=true
  */
 
 const express = require("express");
 const cors = require("cors");
 const sql = require("mssql");
 
-const PORT = parseInt(process.env.PORT || "3000", 10);
+// 🔑 ENV
+const PORT = process.env.PORT; // Railway injeta automaticamente
 const API_KEY = process.env.BRIDGE_API_KEY;
 
+// ⚠️ Não derruba mais a aplicação
 if (!API_KEY) {
   console.warn("[WARN] BRIDGE_API_KEY não encontrada, rodando sem autenticação");
 }
 
+// 🧠 CONFIG SQL SERVER
 const sqlConfig = {
   user: process.env.SQLSERVER_USER,
   password: process.env.SQLSERVER_PASSWORD,
@@ -47,6 +32,7 @@ const sqlConfig = {
   requestTimeout: 60000,
 };
 
+// 🔌 POOL
 let pool;
 async function getPool() {
   if (!pool) {
@@ -56,20 +42,24 @@ async function getPool() {
   return pool;
 }
 
+// 🚀 APP
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: "256kb" }));
 
-// Middleware de autenticação
+// 🔐 AUTH (opcional se API_KEY não existir)
 function requireApiKey(req, res, next) {
+  if (!API_KEY) return next();
+
   const key = req.header("x-api-key");
   if (!key || key !== API_KEY) {
     return res.status(401).json({ error: "UNAUTHORIZED" });
   }
+
   next();
 }
 
-// Whitelist de prefixos / nomes permitidos (espelho do edge bi-query)
+// 📊 WHITELIST
 const ALLOWED_PREFIXES = ["vw_", "v_bi_", "v_gold_"];
 const MAX_LIMIT = 5000;
 
@@ -79,7 +69,7 @@ function isViewAllowed(viewName) {
   return ALLOWED_PREFIXES.some((p) => viewName.startsWith(p));
 }
 
-// Health check
+// ❤️ HEALTH (NUNCA QUEBRA)
 app.get("/health", async (_req, res) => {
   try {
     const p = await getPool();
@@ -87,21 +77,20 @@ app.get("/health", async (_req, res) => {
 
     return res.json({
       status: "ok",
-      db: true
+      db: true,
     });
-
   } catch (err) {
     console.error("Erro no health:", err.message);
 
     return res.json({
       status: "ok",
       db: false,
-      error: err.message
+      error: err.message,
     });
   }
 });
 
-// Query principal
+// 📥 QUERY
 app.post("/api/bi/query", requireApiKey, async (req, res) => {
   const { view, limit } = req.body || {};
 
@@ -111,37 +100,47 @@ app.post("/api/bi/query", requireApiKey, async (req, res) => {
 
   const safeLimit = Math.min(
     Math.max(parseInt(limit, 10) || 1000, 1),
-    MAX_LIMIT,
+    MAX_LIMIT
   );
 
   try {
     const p = await getPool();
+
     const query = `SELECT TOP (${safeLimit}) * FROM [${view}]`;
     const start = Date.now();
+
     const result = await p.request().query(query);
     const duration = Date.now() - start;
 
     console.log(
-      `[QUERY] view=${view} rows=${result.recordset.length} duration=${duration}ms`,
+      `[QUERY] view=${view} rows=${result.recordset.length} duration=${duration}ms`
     );
 
-    res.json({
+    return res.json({
       success: true,
       view,
       data: result.recordset,
-      meta: { count: result.recordset.length, duration_ms: duration },
+      meta: {
+        count: result.recordset.length,
+        duration_ms: duration,
+      },
     });
   } catch (err) {
     console.error(`[ERROR] view=${view}`, err.message);
-    res.status(500).json({ error: "QUERY_FAILED", message: err.message });
+
+    return res.status(500).json({
+      error: "QUERY_FAILED",
+      message: err.message,
+    });
   }
 });
 
+// 🚀 START
 app.listen(PORT, () => {
-  console.log(`[SERVER] SQL Server Bridge rodando na porta ${PORT}`);
+  console.log(`[SERVER] rodando na porta ${PORT}`);
 });
 
-// Encerramento gracioso
+// 🛑 SHUTDOWN
 process.on("SIGTERM", async () => {
   if (pool) await pool.close();
   process.exit(0);
