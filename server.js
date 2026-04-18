@@ -1,50 +1,8 @@
 const express = require("express");
 const sql = require("mssql");
-const cors = require("cors");
 
 const app = express();
-
-app.use(cors({
-  origin: "*",
-  methods: ["GET", "POST"],
-  allowedHeaders: ["Content-Type", "x-api-key"]
-}));
-
 app.use(express.json());
-
-// ==============================
-// API KEY (SEGURANÇA)
-// ==============================
-const API_KEY = process.env.BRIDGE_API_KEY;
-
-function autenticar(req, res, next) {
-  const key = req.headers["x-api-key"];
-
-  if (!API_KEY) {
-    return res.status(500).json({ error: "API KEY não configurada no servidor" });
-  }
-
-  if (!key) {
-    return res.status(401).json({ error: "API KEY não enviada" });
-  }
-
-  if (key !== API_KEY) {
-    return res.status(403).json({ error: "API KEY inválida" });
-  }
-
-  next();
-}
-
-// ==============================
-// DEBUG DE VARIÁVEIS (TEMPORÁRIO)
-// ==============================
-console.log("PORT ENV:", process.env.PORT);
-
-console.log("ENV:", {
-  DB_SERVER: process.env.DB_SERVER,
-  DB_USER: process.env.DB_USER,
-  DB_NAME: process.env.DB_NAME
-});
 
 // ==============================
 // CONFIG SQL SERVER
@@ -58,10 +16,15 @@ const config = {
     encrypt: false,
     trustServerCertificate: true,
   },
+  pool: {
+    max: 10,
+    min: 0,
+    idleTimeoutMillis: 30000,
+  },
 };
 
 // ==============================
-// POOL GLOBAL
+// POOL REUTILIZÁVEL
 // ==============================
 let pool;
 
@@ -73,29 +36,32 @@ async function getPool() {
 }
 
 // ==============================
-// ROTAS LIVRES (SEM AUTH)
+// HEALTH CHECK
 // ==============================
 app.get("/", (req, res) => {
-  res.status(200).json({ status: "running" });
+  res.send("API Bridge rodando 🚀");
 });
 
+// ==============================
+// TESTE DB
+// ==============================
 app.get("/teste-db", async (req, res) => {
   try {
     const pool = await getPool();
     const result = await pool.request().query("SELECT GETDATE() AS data");
     res.json(result.recordset);
   } catch (error) {
+    console.error(error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // ==============================
-// LISTAR VIEWS (PROTEGIDO)
+// LISTAR VIEWS
 // ==============================
-app.get("/views", autenticar, async (req, res) => {
+app.get("/views", async (req, res) => {
   try {
     const pool = await getPool();
-
     const result = await pool.request().query(`
       SELECT TABLE_NAME
       FROM INFORMATION_SCHEMA.VIEWS
@@ -109,45 +75,16 @@ app.get("/views", autenticar, async (req, res) => {
 });
 
 // ==============================
-// CONSULTAR VIEW DINÂMICA
+// CONSULTAR VIEW
 // ==============================
-app.get("/view/:nome", autenticar, async (req, res) => {
+app.get("/view/:nome", async (req, res) => {
   try {
+    const { nome } = req.params;
     const pool = await getPool();
 
-    const nomeView = req.params.nome;
-
-    const limit = parseInt(req.query.limit) || 100;
-    const offset = parseInt(req.query.offset) || 0;
-
-    // filtros dinâmicos
-    const filtros = Object.keys(req.query)
-      .filter((k) => !["limit", "offset"].includes(k))
-      .map((k) => `${k} = @${k}`);
-
-    let where = "";
-    if (filtros.length > 0) {
-      where = "WHERE " + filtros.join(" AND ");
-    }
-
-    const request = pool.request();
-
-    Object.keys(req.query).forEach((key) => {
-      if (!["limit", "offset"].includes(key)) {
-        request.input(key, req.query[key]);
-      }
-    });
-
-    const query = `
-      SELECT *
-      FROM ${nomeView}
-      ${where}
-      ORDER BY 1
-      OFFSET ${offset} ROWS
-      FETCH NEXT ${limit} ROWS ONLY
-    `;
-
-    const result = await request.query(query);
+    const result = await pool.request().query(`
+      SELECT TOP 100 * FROM ${nome}
+    `);
 
     res.json(result.recordset);
   } catch (error) {
@@ -156,13 +93,9 @@ app.get("/view/:nome", autenticar, async (req, res) => {
 });
 
 // ==============================
-// QUERY LIVRE (SOMENTE TESTE)
+// QUERY LIVRE
 // ==============================
-app.get("/health", (req, res) => {
-  res.status(200).json({ status: "ok" });
-});
-
-app.post("/query", autenticar, async (req, res) => {
+app.post("/query", async (req, res) => {
   try {
     const { query } = req.body;
 
