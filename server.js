@@ -7,7 +7,12 @@ app.use(express.json());
 // ==============================
 // CONFIGURAÇÃO SQL SERVER
 // ==============================
-console.log("DB_SERVER:", process.env.DB_SERVER);
+console.log("ENV DEBUG:", {
+  DB_SERVER: process.env.DB_SERVER,
+  DB_USER: process.env.DB_USER,
+  DB_NAME: process.env.DB_NAME
+});
+
 const config = {
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
