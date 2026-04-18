@@ -76,7 +76,7 @@ async function getPool() {
 // ROTAS LIVRES (SEM AUTH)
 // ==============================
 app.get("/", (req, res) => {
-  res.send("API Bridge rodando 🚀");
+  res.status(200).json({ status: "running" });
 });
 
 app.get("/teste-db", async (req, res) => {
@@ -158,6 +158,10 @@ app.get("/view/:nome", autenticar, async (req, res) => {
 // ==============================
 // QUERY LIVRE (SOMENTE TESTE)
 // ==============================
+app.get("/health", (req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
 app.post("/query", autenticar, async (req, res) => {
   try {
     const { query } = req.body;
