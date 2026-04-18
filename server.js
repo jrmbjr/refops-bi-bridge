@@ -79,7 +79,7 @@ app.get("/clientes", async (req, res) => {
 // ==============================
 // START DO SERVIDOR (RAILWAY OK)
 // ==============================
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT;
 
 // rota raiz (obrigatória pro Railway validar)
 app.get("/", (req, res) => {
