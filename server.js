@@ -2,6 +2,13 @@ const express = require("express");
 const sql = require("mssql");
 
 const app = express();
+
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type", "x-api-key"]
+}));
+
 app.use(express.json());
 
 // ==============================
