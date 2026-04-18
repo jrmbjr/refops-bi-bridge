@@ -31,6 +31,8 @@ function autenticar(req, res, next) {
 // DEBUG DE VARIÁVEIS (TEMPORÁRIO)
 // ==============================
 console.log("PORT ENV:", process.env.PORT);
+
+console.log("ENV:", {
   DB_SERVER: process.env.DB_SERVER,
   DB_USER: process.env.DB_USER,
   DB_NAME: process.env.DB_NAME
