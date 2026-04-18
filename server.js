@@ -5,21 +5,15 @@ const app = express();
 app.use(express.json());
 
 // ==============================
-// CONFIGURAÇÃO SQL SERVER
+// CONFIG SQL SERVER
 // ==============================
-console.log("ENV DEBUG:", {
-  DB_SERVER: process.env.DB_SERVER,
-  DB_USER: process.env.DB_USER,
-  DB_NAME: process.env.DB_NAME
-});
-
 const config = {
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
-  server: process.env.DB_SERVER, // ex: 123.123.123.123
+  server: process.env.DB_SERVER,
   database: process.env.DB_NAME,
   options: {
-    encrypt: false, // true se for Azure
+    encrypt: false,
     trustServerCertificate: true,
   },
   pool: {
@@ -29,71 +23,73 @@ const config = {
   },
 };
 
-// ==============================
-// POOL DE CONEXÃO (REUTILIZÁVEL)
-// ==============================
 let pool;
 
 async function getPool() {
   if (!pool) {
+    console.log("[DB] conectando...");
     pool = await sql.connect(config);
+    console.log("[DB] conectado");
   }
   return pool;
 }
 
 // ==============================
-// HEALTH CHECK
+// HEALTH
 // ==============================
 app.get("/", (req, res) => {
   res.send("API Bridge rodando 🚀");
 });
 
+app.get("/ping", (req, res) => {
+  res.json({ status: "alive" });
+});
+
 // ==============================
-// TESTE DE BANCO
+// TESTE BANCO
 // ==============================
 app.get("/teste-db", async (req, res) => {
   try {
-    const pool = await getPool();
-    const result = await pool.request().query("SELECT GETDATE() AS data");
-
+    const p = await getPool();
+    const result = await p.request().query("SELECT GETDATE() AS data");
     res.json(result.recordset);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
 // ==============================
-// EXEMPLO USANDO VIEW (RECOMENDADO)
+// 🔥 QUERY DINÂMICA (ESSENCIAL)
 // ==============================
-app.get("/clientes", async (req, res) => {
+app.post("/api/query", async (req, res) => {
+  const { query } = req.body;
+
+  if (!query) {
+    return res.status(400).json({ error: "QUERY_REQUIRED" });
+  }
+
   try {
-    const pool = await getPool();
+    const p = await getPool();
+    const result = await p.request().query(query);
 
-    const result = await pool.request().query(`
-      SELECT TOP 100 *
-      FROM SUA_VIEW_AQUI
-    `);
+    res.json({
+      success: true,
+      data: result.recordset,
+    });
 
-    res.json(result.recordset);
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: error.message });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      error: "QUERY_FAILED",
+      message: err.message,
+    });
   }
 });
 
 // ==============================
-// START DO SERVIDOR (RAILWAY OK)
+// START (CORRETO NO RAILWAY)
 // ==============================
-const PORT = 3000;
-
-app.get("/", (req, res) => {
-  res.status(200).send("OK");
-});
-
-app.get("/ping", (req, res) => {
-  res.status(200).json({ status: "alive" });
-});
+const PORT = process.env.PORT;
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Servidor rodando na porta " + PORT);
