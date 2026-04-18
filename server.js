@@ -20,7 +20,6 @@
  *   SQLSERVER_TRUST_CERT=true
  */
 
-require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const sql = require("mssql");
@@ -29,8 +28,7 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
 const API_KEY = process.env.BRIDGE_API_KEY;
 
 if (!API_KEY) {
-  console.error("[FATAL] BRIDGE_API_KEY não configurado no .env");
-  process.exit(1);
+  console.warn("[WARN] BRIDGE_API_KEY não encontrada, rodando sem autenticação");
 }
 
 const sqlConfig = {
