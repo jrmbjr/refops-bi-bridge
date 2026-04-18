@@ -170,7 +170,7 @@ app.post("/query", autenticar, async (req, res) => {
 // ==============================
 // START SERVER
 // ==============================
-const PORT = process.env.PORT;
+const PORT = 3000;
 
 if (!PORT) {
   throw new Error("PORT não definida pelo Railway");
