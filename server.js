@@ -81,17 +81,18 @@ app.get("/clientes", async (req, res) => {
 // ==============================
 const PORT = process.env.PORT;
 
-// rota raiz (obrigatória pro Railway validar)
+if (!PORT) {
+  throw new Error("PORT não definida pelo Railway");
+}
+
 app.get("/", (req, res) => {
   res.status(200).send("OK");
 });
 
-// rota simples de teste
 app.get("/ping", (req, res) => {
   res.status(200).json({ status: "alive" });
 });
 
-// start correto
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
+  console.log("Servidor rodando na porta " + PORT);
 });
