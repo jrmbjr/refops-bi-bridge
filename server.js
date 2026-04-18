@@ -1,5 +1,5 @@
-import express from "express";
-import sql from "mssql";
+const express = require("express");
+const sql = require("mssql");
 
 const app = express();
 app.use(express.json());
