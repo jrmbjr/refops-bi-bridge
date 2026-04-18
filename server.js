@@ -28,6 +28,15 @@ function autenticar(req, res, next) {
 }
 
 // ==============================
+// DEBUG DE VARIÁVEIS (TEMPORÁRIO)
+// ==============================
+console.log("ENV:", {
+  DB_SERVER: process.env.DB_SERVER,
+  DB_USER: process.env.DB_USER,
+  DB_NAME: process.env.DB_NAME
+});
+
+// ==============================
 // CONFIG SQL SERVER
 // ==============================
 const config = {
@@ -38,11 +47,6 @@ const config = {
   options: {
     encrypt: false,
     trustServerCertificate: true,
-  },
-  pool: {
-    max: 10,
-    min: 0,
-    idleTimeoutMillis: 30000,
   },
 };
 
