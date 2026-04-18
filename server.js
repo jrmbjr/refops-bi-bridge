@@ -79,11 +79,7 @@ app.get("/clientes", async (req, res) => {
 // ==============================
 // START DO SERVIDOR (RAILWAY OK)
 // ==============================
-const PORT = process.env.PORT;
-
-if (!PORT) {
-  throw new Error("PORT não definida pelo Railway");
-}
+const PORT = 3000;
 
 app.get("/", (req, res) => {
   res.status(200).send("OK");
