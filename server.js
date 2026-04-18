@@ -7,10 +7,10 @@ const cors = require("cors");
 const sql = require("mssql");
 
 // 🔑 ENV
-const PORT = process.env.PORT; // Railway injeta automaticamente
+const PORT = process.env.PORT; // obrigatório no Railway
 const API_KEY = process.env.BRIDGE_API_KEY;
 
-// ⚠️ Não derruba mais a aplicação
+// ⚠️ não derruba a API
 if (!API_KEY) {
   console.warn("[WARN] BRIDGE_API_KEY não encontrada, rodando sem autenticação");
 }
@@ -28,16 +28,17 @@ const sqlConfig = {
     trustServerCertificate: process.env.SQLSERVER_TRUST_CERT !== "false",
     enableArithAbort: true,
   },
-  connectionTimeout: 30000,
-  requestTimeout: 60000,
+  connectionTimeout: 15000,
+  requestTimeout: 30000,
 };
 
-// 🔌 POOL
+// 🔌 POOL (lazy, só conecta quando precisa)
 let pool;
 async function getPool() {
   if (!pool) {
+    console.log("[DB] tentando conectar...");
     pool = await sql.connect(sqlConfig);
-    console.log("[DB] Pool SQL Server conectado");
+    console.log("[DB] conectado");
   }
   return pool;
 }
@@ -47,7 +48,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "256kb" }));
 
-// 🔐 AUTH (opcional se API_KEY não existir)
+// 🔐 AUTH (só valida se existir API_KEY)
 function requireApiKey(req, res, next) {
   if (!API_KEY) return next();
 
@@ -69,8 +70,16 @@ function isViewAllowed(viewName) {
   return ALLOWED_PREFIXES.some((p) => viewName.startsWith(p));
 }
 
-// ❤️ HEALTH (NUNCA QUEBRA)
-app.get("/health", async (_req, res) => {
+// ❤️ HEALTH (NÃO depende do banco)
+app.get("/health", (_req, res) => {
+  return res.json({
+    status: "ok",
+    service: "refops-bi-bridge",
+  });
+});
+
+// 🔎 CHECK DB (endpoint separado para diagnóstico)
+app.get("/health/db", async (_req, res) => {
   try {
     const p = await getPool();
     await p.request().query("SELECT 1 AS ok");
@@ -80,7 +89,7 @@ app.get("/health", async (_req, res) => {
       db: true,
     });
   } catch (err) {
-    console.error("Erro no health:", err.message);
+    console.error("[DB ERROR]", err.message);
 
     return res.json({
       status: "ok",
