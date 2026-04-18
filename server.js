@@ -1,114 +1,78 @@
-const express = require("express");
-const cors = require("cors");
-const sql = require("mssql");
+import express from "express";
+import sql from "mssql";
 
 const app = express();
-
-// 🔑 Porta do Railway (NÃO alterar)
-const PORT = process.env.PORT;
-
-// 🔐 API Key (opcional)
-const API_KEY = process.env.BRIDGE_API_KEY;
-
-// ⚠️ aviso apenas
-if (!API_KEY) {
-  console.warn("[WARN] BRIDGE_API_KEY não encontrada");
-}
-
-// Middlewares
-app.use(cors());
 app.use(express.json());
 
-// 🔥 ROTA RAIZ (ESSENCIAL)
-app.get("/", (req, res) => {
-  res.send("RefOps BI Bridge rodando");
-});
-
-// ❤️ HEALTH (rápido, sem banco)
-app.get("/health", (req, res) => {
-  res.json({
-    status: "ok",
-    service: "refops-bi-bridge",
-  });
-});
-
-// 🔎 CONFIG SQL (só será usado quando necessário)
-const sqlConfig = {
-  user: process.env.SQLSERVER_USER,
-  password: process.env.SQLSERVER_PASSWORD,
-  server: process.env.SQLSERVER_HOST,
-  port: parseInt(process.env.SQLSERVER_PORT || "1433", 10),
-  database: process.env.SQLSERVER_DB,
+// CONFIG SQL SERVER
+const config = {
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  server: process.env.DB_SERVER, // ex: 123.123.123.123
+  database: process.env.DB_NAME,
   options: {
-    encrypt: true,
+    encrypt: false, // true se usar Azure
     trustServerCertificate: true,
+  },
+  pool: {
+    max: 10,
+    min: 0,
+    idleTimeoutMillis: 30000,
   },
 };
 
-// 🔌 Conexão lazy
+// CONEXÃO GLOBAL (POOL)
 let pool;
+
 async function getPool() {
   if (!pool) {
-    console.log("[DB] conectando...");
-    pool = await sql.connect(sqlConfig);
-    console.log("[DB] conectado");
+    pool = await sql.connect(config);
   }
   return pool;
 }
 
-// 🔐 Middleware de autenticação (se houver API key)
-function requireApiKey(req, res, next) {
-  if (!API_KEY) return next();
+// HEALTH CHECK
+app.get("/", (req, res) => {
+  res.send("API Bridge rodando 🚀");
+});
 
-  const key = req.header("x-api-key");
-  if (key !== API_KEY) {
-    return res.status(401).json({ error: "UNAUTHORIZED" });
-  }
-
-  next();
-}
-
-// 🔎 Teste de banco (isolado)
-app.get("/health/db", async (req, res) => {
+// QUERY GENÉRICA (CUIDADO EM PRODUÇÃO)
+app.post("/query", async (req, res) => {
   try {
-    const p = await getPool();
-    await p.request().query("SELECT 1");
+    const { query } = req.body;
 
-    res.json({ status: "ok", db: true });
-  } catch (err) {
-    res.json({
-      status: "ok",
-      db: false,
-      error: err.message,
-    });
+    if (!query) {
+      return res.status(400).json({ error: "Query não enviada" });
+    }
+
+    const pool = await getPool();
+    const result = await pool.request().query(query);
+
+    res.json(result.recordset);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: "Erro ao executar query" });
   }
 });
 
-// 📊 Query simples (teste)
-app.post("/api/query", requireApiKey, async (req, res) => {
-  const { query } = req.body;
-
-  if (!query) {
-    return res.status(400).json({ error: "QUERY_REQUIRED" });
-  }
-
+// EXEMPLO DE ROTA ESPECÍFICA (RECOMENDADO)
+app.get("/clientes", async (req, res) => {
   try {
-    const p = await getPool();
-    const result = await p.request().query(query);
+    const pool = await getPool();
+    const result = await pool.request().query(`
+      SELECT TOP 100 *
+      FROM Clientes
+    `);
 
-    res.json({
-      success: true,
-      data: result.recordset,
-    });
-  } catch (err) {
-    res.status(500).json({
-      error: "QUERY_FAILED",
-      message: err.message,
-    });
+    res.json(result.recordset);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
-// 🚀 START
+// PORTA DINÂMICA (ESSENCIAL PRA RAILWAY)
+const PORT = process.env.PORT || 3000;
+
 app.listen(PORT, () => {
-  console.log("[SERVER] rodando na porta", PORT);
+  console.log(`Servidor rodando na porta ${PORT}`);
 });
