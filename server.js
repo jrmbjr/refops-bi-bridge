@@ -52,7 +52,7 @@ const sqlConfig = {
     enableArithAbort: true,
   },
   connectionTimeout: 30000,
-  requestTimeout: 60000,
+  requestTimeout: 180000,
 };
 
 let pool;
@@ -236,7 +236,7 @@ app.post("/query", requireApiKey, async (req, res) => {
     );
     // Como já começamos a escrever, fecha o JSON com flag de erro nos meta
     try {
-      res.write(`],"meta":{"count":${rowCount},"duration_ms":${duration},"error":${JSON.stringify(err.message)}}}`);
+      res.write(`],"success":false,"meta":{"count":${rowCount},"duration_ms":${duration},"error":${JSON.stringify(err.message)}}}`);
       res.end();
     } catch (_) {
       try { res.end(); } catch (_e) { /* noop */ }
