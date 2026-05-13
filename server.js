@@ -8,7 +8,7 @@
  *   POST /refresh/renovacoes-inadimplencia
  *
  * Autenticacao:
- *   Header: x-api-key: <r5403zmeyqri80ueu77lpht4ircchcnf>
+ *   Header: x-api-key: <BRIDGE_API_KEY>
  */
 
 require("dotenv").config();
@@ -166,6 +166,20 @@ function getLimiterStats() {
     concurrency: SQLSERVER_QUERY_CONCURRENCY,
     active: queryLimiter.activeCount,
     pending: queryLimiter.pendingCount,
+  };
+}
+
+function getStartupConfig() {
+  return {
+    node_env: process.env.NODE_ENV || "development",
+    port: PORT,
+    sqlserver_request_timeout_ms: REQUEST_TIMEOUT_MS,
+    sqlserver_refresh_timeout_ms: REFRESH_TIMEOUT_MS,
+    sqlserver_pool_max: SQLSERVER_POOL_MAX,
+    sqlserver_pool_min: SQLSERVER_POOL_MIN,
+    sqlserver_query_concurrency: SQLSERVER_QUERY_CONCURRENCY,
+    sqlserver_query_cache_ttl_seconds: SQLSERVER_QUERY_CACHE_TTL_SECONDS,
+    sqlserver_query_cache_max_keys: SQLSERVER_QUERY_CACHE_MAX_KEYS,
   };
 }
 
@@ -614,6 +628,8 @@ app.post("/query", requireApiKey, async (req, res) => {
     const durationMs = Date.now() - startedAt;
     const classified = classifyAppError(error, req, effectiveTimeoutMs);
     const cacheStatus = getCacheStatus(cacheEnabled, false);
+    const poolStats = getPoolStats();
+    const limiterStats = getLimiterStats();
     logStructured("error", {
       route: "/query",
       request_id: requestId,
@@ -626,8 +642,13 @@ app.post("/query", requireApiKey, async (req, res) => {
       sql_error_number: classified.number,
       message: classified.message,
       cache: cacheStatus,
-      pool: getPoolStats(),
-      limiter: getLimiterStats(),
+      pool: poolStats,
+      limiter: limiterStats,
+      "limiter.active": limiterStats.active,
+      "limiter.pending": limiterStats.pending,
+      "pool.connected": poolStats.connected,
+      "pool.configured_max": poolStats.configured_max,
+      "pool.configured_min": poolStats.configured_min,
     });
     return sendError(res, {
       httpStatus: classified.httpStatus,
@@ -831,6 +852,7 @@ server = app.listen(PORT, () => {
     route: "startup",
     status: "listening",
     port: PORT,
+    config: getStartupConfig(),
   });
 });
 
