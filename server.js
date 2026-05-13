@@ -8,7 +8,7 @@
  *   POST /refresh/renovacoes-inadimplencia
  *
  * Autenticacao:
- *   Header: x-api-key: <BRIDGE_API_KEY>
+ *   Header: x-api-key: <r5403zmeyqri80ueu77lpht4ircchcnf>
  */
 
 require("dotenv").config();
@@ -629,6 +629,16 @@ app.post("/query", requireApiKey, async (req, res) => {
           queryLimiter.activeCount,
           queryLimiter.pendingCount,
         );
+        console.log(
+          "[query:execute:visible]",
+          JSON.stringify({
+            route: "/query",
+            query_name: queryName,
+            request_id: requestId,
+            limiter: getLimiterStats(),
+            pool: getPoolStats(),
+          }),
+        );
         return runSqlQuery(sqlText, params, effectiveTimeoutMs, req);
       });
       if (cacheEnabled) {
@@ -671,6 +681,20 @@ app.post("/query", requireApiKey, async (req, res) => {
     const cacheStatus = getCacheStatus(cacheEnabled, false);
     const operationalFields = buildOperationalLogFields("/query", queryName, durationMs, cacheStatus);
     console.log("[query:error]", queryName, requestId, durationMs, classified.code);
+    console.log(
+      "[query:error:visible]",
+      JSON.stringify({
+        route: "/query",
+        query_name: queryName,
+        request_id: requestId,
+        duration_ms: durationMs,
+        error_code: classified.code,
+        message: classified.message,
+        cache: cacheStatus,
+        limiter: getLimiterStats(),
+        pool: getPoolStats(),
+      }),
+    );
     logStructured("error", {
       request_id: requestId,
       trace_id: traceId,
