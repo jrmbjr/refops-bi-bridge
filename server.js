@@ -8,7 +8,7 @@
  *   POST /refresh/renovacoes-inadimplencia
  *
  * Autenticacao:
- *   Header: x-api-key: <BRIDGE_API_KEY>
+ *   Header: x-api-key: <r5403zmeyqri80ueu77lpht4ircchcnf>
  */
 
 require("dotenv").config();
