@@ -50,6 +50,8 @@ const sqlConfig = {
 };
 
 let pool;
+let server;
+let shuttingDown = false;
 async function getPool() {
   if (!pool) {
     pool = await sql.connect(sqlConfig);
@@ -97,6 +99,29 @@ function logStructured(level, payload) {
   console.log(line);
 }
 
+function attachRequestContext(req, fallbackQueryName) {
+  if (!req.bridgeContext) {
+    const requestId = getRequestId(req);
+    req.bridgeContext = {
+      requestId,
+      traceId: getTraceId(req, requestId),
+      queryName: getQueryName(req, fallbackQueryName),
+      startedAt: Date.now(),
+    };
+  } else if (fallbackQueryName && (!req.bridgeContext.queryName || req.bridgeContext.queryName === "unknown")) {
+    req.bridgeContext.queryName = fallbackQueryName;
+  }
+  return req.bridgeContext;
+}
+
+function getContext(req, fallbackQueryName = "unknown") {
+  return attachRequestContext(req, fallbackQueryName);
+}
+
+function durationSince(startedAt) {
+  return Math.max(Date.now() - Number(startedAt || Date.now()), 0);
+}
+
 function parseWindows(input) {
   const raw = Array.isArray(input) ? input.join(",") : String(input || "90,180,365");
   const values = raw
@@ -130,6 +155,26 @@ function classifySqlError(error) {
   return { httpStatus: 500, retryable: false, code, number, message };
 }
 
+function classifyAppError(error, req, upstreamTimeoutMs = REQUEST_TIMEOUT_MS) {
+  const message = String(error && error.message ? error.message : "Unexpected application error");
+  const code = error && error.code ? String(error.code) : "APP_ERROR";
+  const lower = message.toLowerCase();
+
+  if (error && error.type === "entity.parse.failed") {
+    return { httpStatus: 400, retryable: false, code: "INVALID_JSON", number: null, message: "Invalid JSON body" };
+  }
+  if (error && error.type === "entity.too.large") {
+    return { httpStatus: 400, retryable: false, code: "REQUEST_TOO_LARGE", number: null, message: "Request body too large" };
+  }
+  if (req && (req.aborted || lower.includes("request aborted") || code === "ECONNRESET")) {
+    return { httpStatus: 499, retryable: true, code: "REQUEST_ABORTED", number: null, message: "Request aborted by client" };
+  }
+  return {
+    ...classifySqlError(error),
+    upstreamTimeoutMs,
+  };
+}
+
 function sendError(res, {
   httpStatus,
   code,
@@ -161,6 +206,7 @@ function sendError(res, {
 }
 
 function requireApiKey(req, res, next) {
+  const { requestId, traceId, queryName, startedAt } = getContext(req, "auth");
   const key = req.header("x-api-key");
   if (!key || key !== API_KEY) {
     return res.status(401).json({
@@ -171,10 +217,10 @@ function requireApiKey(req, res, next) {
         retryable: false,
       },
       meta: {
-        request_id: getRequestId(req),
-        trace_id: getTraceId(req),
-        query_name: getQueryName(req, "auth"),
-        duration_ms: 0,
+        request_id: requestId,
+        trace_id: traceId,
+        query_name: queryName,
+        duration_ms: durationSince(startedAt),
       },
     });
   }
@@ -225,7 +271,54 @@ async function queryLatestRefreshLog() {
 
 const app = express();
 app.use(cors());
+app.use((req, res, next) => {
+  const ctx = attachRequestContext(req, "request");
+  req.on("aborted", () => {
+    logStructured("error", {
+      route: req.path,
+      request_id: ctx.requestId,
+      trace_id: ctx.traceId,
+      query_name: ctx.queryName,
+      duration_ms: durationSince(ctx.startedAt),
+      status: "aborted",
+      error_code: "REQUEST_ABORTED",
+      error_class: "operational",
+      message: "Client aborted request",
+    });
+  });
+  next();
+});
 app.use(express.json({ limit: "256kb" }));
+app.use((error, req, res, next) => {
+  if (!error) return next();
+  const ctx = getContext(req, "json_parse");
+  const classified = classifyAppError(error, req, REQUEST_TIMEOUT_MS);
+  logStructured("error", {
+    route: req.path,
+    request_id: ctx.requestId,
+    trace_id: ctx.traceId,
+    query_name: ctx.queryName,
+    duration_ms: durationSince(ctx.startedAt),
+    status: "error",
+    error_code: classified.code,
+    error_class: "operational",
+    sql_error_number: classified.number,
+    message: classified.message,
+  });
+  if (res.headersSent || req.aborted) return;
+  return sendError(res, {
+    httpStatus: classified.httpStatus,
+    code: classified.code,
+    message: classified.message,
+    retryable: classified.retryable,
+    requestId: ctx.requestId,
+    traceId: ctx.traceId,
+    queryName: ctx.queryName,
+    durationMs: durationSince(ctx.startedAt),
+    upstreamTimeoutMs: classified.upstreamTimeoutMs ?? REQUEST_TIMEOUT_MS,
+    sqlErrorNumber: classified.number,
+  });
+});
 
 app.get("/health", async (_req, res) => {
   try {
@@ -242,10 +335,7 @@ app.get("/health", async (_req, res) => {
 
 app.post("/api/bi/query", requireApiKey, async (req, res) => {
   const { view, limit } = req.body || {};
-  const requestId = getRequestId(req);
-  const traceId = getTraceId(req, requestId);
-  const queryName = getQueryName(req, "api_bi_query");
-  const startedAt = Date.now();
+  const { requestId, traceId, queryName, startedAt } = getContext(req, "api_bi_query");
 
   if (!isViewAllowed(view)) {
     return sendError(res, {
@@ -320,10 +410,7 @@ app.post("/api/bi/query", requireApiKey, async (req, res) => {
 
 app.post("/query", requireApiKey, async (req, res) => {
   const { sql: sqlText, params = {}, timeoutMs } = req.body || {};
-  const requestId = getRequestId(req);
-  const traceId = getTraceId(req, requestId);
-  const queryName = getQueryName(req, "query");
-  const startedAt = Date.now();
+  const { requestId, traceId, queryName, startedAt } = getContext(req, "query");
   const effectiveTimeoutMs = Math.min(Math.max(Number(timeoutMs) || REQUEST_TIMEOUT_MS, 1000), 600000);
 
   if (!isSqlAllowed(sqlText)) {
@@ -395,10 +482,7 @@ app.post("/query", requireApiKey, async (req, res) => {
 });
 
 app.post("/refresh/renovacoes-inadimplencia", requireApiKey, async (req, res) => {
-  const requestId = getRequestId(req);
-  const traceId = getTraceId(req, requestId);
-  const queryName = getQueryName(req, "refresh_renovacoes_inadimplencia");
-  const startedAt = Date.now();
+  const { requestId, traceId, queryName, startedAt } = getContext(req, "refresh_renovacoes_inadimplencia");
   const windows = parseWindows(req.body && (req.body.windows || req.body.janelas));
 
   if (!windows) {
@@ -491,9 +575,7 @@ app.post("/refresh/renovacoes-inadimplencia", requireApiKey, async (req, res) =>
 });
 
 app.use((req, res) => {
-  const requestId = getRequestId(req);
-  const traceId = getTraceId(req, requestId);
-  const queryName = getQueryName(req, "not_found");
+  const { requestId, traceId, queryName, startedAt } = getContext(req, "not_found");
   return res.status(404).json({
     success: false,
     error: {
@@ -505,27 +587,27 @@ app.use((req, res) => {
       request_id: requestId,
       trace_id: traceId,
       query_name: queryName,
-      duration_ms: 0,
+      duration_ms: durationSince(startedAt),
     },
   });
 });
 
 app.use((error, req, res, _next) => {
-  const requestId = getRequestId(req);
-  const traceId = getTraceId(req, requestId);
-  const queryName = getQueryName(req, "express_error");
-  const classified = classifySqlError(error);
+  const { requestId, traceId, queryName, startedAt } = getContext(req, "express_error");
+  const classified = classifyAppError(error, req, REQUEST_TIMEOUT_MS);
   logStructured("error", {
     route: req.path,
     request_id: requestId,
     trace_id: traceId,
     query_name: queryName,
-    duration_ms: 0,
+    duration_ms: durationSince(startedAt),
     status: "error",
     error_code: classified.code,
+    error_class: classified.httpStatus >= 500 ? "fatal" : "operational",
     sql_error_number: classified.number,
     message: classified.message,
   });
+  if (res.headersSent || req.aborted) return;
   return sendError(res, {
     httpStatus: classified.httpStatus,
     code: classified.code,
@@ -534,13 +616,50 @@ app.use((error, req, res, _next) => {
     requestId,
     traceId,
     queryName,
-    durationMs: 0,
-    upstreamTimeoutMs: REQUEST_TIMEOUT_MS,
+    durationMs: durationSince(startedAt),
+    upstreamTimeoutMs: classified.upstreamTimeoutMs ?? REQUEST_TIMEOUT_MS,
     sqlErrorNumber: classified.number,
   });
 });
 
-app.listen(PORT, () => {
+async function closePoolSafely() {
+  if (!pool) return;
+  try {
+    await pool.close();
+  } catch (error) {
+    logStructured("error", {
+      route: "shutdown",
+      status: "error",
+      error_code: "POOL_CLOSE_FAILED",
+      error_class: "operational",
+      message: error.message,
+    });
+  } finally {
+    pool = null;
+  }
+}
+
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  logStructured("info", {
+    route: "shutdown",
+    status: "started",
+    signal,
+  });
+  if (server) {
+    await new Promise((resolve) => server.close(resolve));
+  }
+  await closePoolSafely();
+  logStructured("info", {
+    route: "shutdown",
+    status: "completed",
+    signal,
+  });
+  process.exit(0);
+}
+
+server = app.listen(PORT, () => {
   logStructured("info", {
     route: "startup",
     status: "listening",
@@ -548,7 +667,37 @@ app.listen(PORT, () => {
   });
 });
 
-process.on("SIGTERM", async () => {
-  if (pool) await pool.close();
-  process.exit(0);
+process.on("unhandledRejection", (reason) => {
+  const error = reason instanceof Error ? reason : new Error(String(reason));
+  const classified = classifyAppError(error, null, REQUEST_TIMEOUT_MS);
+  logStructured("error", {
+    route: "process",
+    status: "error",
+    error_code: classified.code,
+    error_class: "fatal",
+    sql_error_number: classified.number,
+    message: classified.message,
+    event: "unhandledRejection",
+  });
+});
+
+process.on("uncaughtException", (error) => {
+  const classified = classifyAppError(error, null, REQUEST_TIMEOUT_MS);
+  logStructured("error", {
+    route: "process",
+    status: "error",
+    error_code: classified.code,
+    error_class: "fatal",
+    sql_error_number: classified.number,
+    message: classified.message,
+    event: "uncaughtException",
+  });
+});
+
+process.on("SIGTERM", () => {
+  void gracefulShutdown("SIGTERM");
+});
+
+process.on("SIGINT", () => {
+  void gracefulShutdown("SIGINT");
 });
