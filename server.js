@@ -8,13 +8,15 @@
  *   POST /refresh/renovacoes-inadimplencia
  *
  * Autenticacao:
- *   Header: x-api-key: <BRIDGE_API_KEY>
+ *   Header: x-api-key: <r5403zmeyqri80ueu77lpht4ircchcnf>
  */
 
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const sql = require("mssql");
+const pLimit = require("p-limit");
+const NodeCache = require("node-cache");
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const API_KEY = process.env.BRIDGE_API_KEY;
@@ -27,6 +29,14 @@ const REFRESH_TIMEOUT_MS = Math.min(
   600000,
 );
 const BRIDGE_NAME = "sqlserver-bridge";
+const SQLSERVER_POOL_MAX = Math.max(parseInt(process.env.SQLSERVER_POOL_MAX || "20", 10), 1);
+const SQLSERVER_POOL_MIN = Math.min(SQLSERVER_POOL_MAX, Math.max(parseInt(process.env.SQLSERVER_POOL_MIN || "2", 10), 0));
+const SQLSERVER_POOL_IDLE_TIMEOUT_MS = Math.max(parseInt(process.env.SQLSERVER_POOL_IDLE_TIMEOUT_MS || "30000", 10), 1000);
+const SQLSERVER_POOL_ACQUIRE_TIMEOUT_MS = Math.max(parseInt(process.env.SQLSERVER_POOL_ACQUIRE_TIMEOUT_MS || "30000", 10), 1000);
+const SQLSERVER_QUERY_CONCURRENCY = Math.max(parseInt(process.env.SQLSERVER_QUERY_CONCURRENCY || "5", 10), 1);
+const SQLSERVER_QUERY_CACHE_TTL_SECONDS = Math.max(parseInt(process.env.SQLSERVER_QUERY_CACHE_TTL_SECONDS || "60", 10), 0);
+const SQLSERVER_QUERY_CACHE_MAX_KEYS = Math.max(parseInt(process.env.SQLSERVER_QUERY_CACHE_MAX_KEYS || "300", 10), 1);
+const CACHEABLE_QUERY_TOKENS = ["contratos-renovacao", "renovacoes", "inadimplencia"];
 
 if (!API_KEY) {
   console.error("[FATAL] BRIDGE_API_KEY nao configurado no .env");
@@ -39,7 +49,12 @@ const sqlConfig = {
   server: process.env.SQLSERVER_HOST,
   port: parseInt(process.env.SQLSERVER_PORT || "1433", 10),
   database: process.env.SQLSERVER_DB,
-  pool: { max: 10, min: 0, idleTimeoutMillis: 30000 },
+  pool: {
+    max: SQLSERVER_POOL_MAX,
+    min: SQLSERVER_POOL_MIN,
+    idleTimeoutMillis: SQLSERVER_POOL_IDLE_TIMEOUT_MS,
+    acquireTimeoutMillis: SQLSERVER_POOL_ACQUIRE_TIMEOUT_MS,
+  },
   options: {
     encrypt: process.env.SQLSERVER_ENCRYPT !== "false",
     trustServerCertificate: process.env.SQLSERVER_TRUST_CERT !== "false",
@@ -52,6 +67,13 @@ const sqlConfig = {
 let pool;
 let server;
 let shuttingDown = false;
+const queryLimiter = pLimit(SQLSERVER_QUERY_CONCURRENCY);
+const queryCache = new NodeCache({
+  stdTTL: SQLSERVER_QUERY_CACHE_TTL_SECONDS,
+  checkperiod: Math.max(Math.min(SQLSERVER_QUERY_CACHE_TTL_SECONDS, 60), 1),
+  useClones: false,
+  maxKeys: SQLSERVER_QUERY_CACHE_MAX_KEYS,
+});
 async function getPool() {
   if (!pool) {
     pool = await sql.connect(sqlConfig);
@@ -59,6 +81,7 @@ async function getPool() {
       route: "startup",
       status: "connected",
       message: "SQL Server pool conectado",
+      pool: getPoolStats(),
     });
   }
   return pool;
@@ -120,6 +143,30 @@ function getContext(req, fallbackQueryName = "unknown") {
 
 function durationSince(startedAt) {
   return Math.max(Date.now() - Number(startedAt || Date.now()), 0);
+}
+
+function getPoolStats() {
+  const stats = {
+    configured_max: SQLSERVER_POOL_MAX,
+    configured_min: SQLSERVER_POOL_MIN,
+    acquire_timeout_ms: SQLSERVER_POOL_ACQUIRE_TIMEOUT_MS,
+    connected: Boolean(pool && pool.connected),
+  };
+  const internalPool = pool && pool.pool;
+  if (!internalPool) return stats;
+  if (typeof internalPool.numUsed === "function") stats.used = internalPool.numUsed();
+  if (typeof internalPool.numFree === "function") stats.free = internalPool.numFree();
+  if (typeof internalPool.numPendingAcquires === "function") stats.pending_acquires = internalPool.numPendingAcquires();
+  if (typeof internalPool.numPendingCreates === "function") stats.pending_creates = internalPool.numPendingCreates();
+  return stats;
+}
+
+function getLimiterStats() {
+  return {
+    concurrency: SQLSERVER_QUERY_CONCURRENCY,
+    active: queryLimiter.activeCount,
+    pending: queryLimiter.pendingCount,
+  };
 }
 
 function parseWindows(input) {
@@ -186,6 +233,7 @@ function sendError(res, {
   durationMs,
   upstreamTimeoutMs,
   sqlErrorNumber = null,
+  metaExtras = null,
 }) {
   return res.status(httpStatus).json({
     success: false,
@@ -201,6 +249,7 @@ function sendError(res, {
       query_name: queryName,
       duration_ms: durationMs,
       upstream_timeout_ms: upstreamTimeoutMs,
+      ...(metaExtras || {}),
     },
   });
 }
@@ -240,14 +289,87 @@ function isSqlAllowed(sqlText) {
   return typeof sqlText === "string" && /^\s*(WITH|SELECT|EXEC)\b/i.test(sqlText);
 }
 
-async function runSqlQuery(sqlText, params, timeoutMs) {
+function isCacheableSql(sqlText) {
+  return typeof sqlText === "string" && /^\s*(WITH|SELECT)\b/i.test(sqlText);
+}
+
+function shouldCacheQuery(sqlText, queryName) {
+  if (!SQLSERVER_QUERY_CACHE_TTL_SECONDS || !isCacheableSql(sqlText)) return false;
+  const normalized = String(queryName || "").toLowerCase();
+  return CACHEABLE_QUERY_TOKENS.some((token) => normalized.includes(token));
+}
+
+function buildQueryCacheKey(sqlText, params, queryName) {
+  return JSON.stringify({
+    sql: sqlText,
+    params: params || {},
+    query_name: String(queryName || "").toLowerCase(),
+  });
+}
+
+function getCacheStatus(cacheEnabled, cacheHit) {
+  if (!cacheEnabled) return "bypass";
+  return cacheHit ? "hit" : "miss";
+}
+
+async function runSqlQuery(sqlText, params, timeoutMs, req = null) {
   const activePool = await getPool();
   const request = activePool.request();
   request.timeout = timeoutMs;
+  let bridgeTimedOut = false;
+  let clientAborted = false;
+  let cancelIssued = false;
+
+  const cancelRequest = () => {
+    if (cancelIssued) return;
+    cancelIssued = true;
+    try {
+      request.cancel();
+    } catch (_error) {
+      // Best effort cancellation only.
+    }
+  };
+
+  const onAbort = () => {
+    clientAborted = true;
+    cancelRequest();
+  };
+
+  const onClose = () => {
+    if (req && req.aborted) onAbort();
+  };
+
+  const timeoutHandle = setTimeout(() => {
+    bridgeTimedOut = true;
+    cancelRequest();
+  }, timeoutMs + 50);
+
+  if (req) {
+    req.on("aborted", onAbort);
+    req.on("close", onClose);
+  }
+
   for (const [key, value] of Object.entries(params || {})) {
     request.input(key, value);
   }
-  return request.query(sqlText);
+  try {
+    return await request.query(sqlText);
+  } catch (error) {
+    if (bridgeTimedOut) {
+      error.code = "ETIMEOUT";
+      error.message = `Request failed to complete in ${timeoutMs}ms`;
+    } else if (clientAborted) {
+      error.code = "ECONNRESET";
+      error.message = "Request aborted by client";
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutHandle);
+    if (req) {
+      req.removeListener("aborted", onAbort);
+      req.removeListener("close", onClose);
+    }
+  }
 }
 
 async function queryLatestRefreshLog() {
@@ -355,7 +477,7 @@ app.post("/api/bi/query", requireApiKey, async (req, res) => {
 
   try {
     const sqlText = `SELECT TOP (${safeLimit}) * FROM [${view}]`;
-    const result = await runSqlQuery(sqlText, {}, REQUEST_TIMEOUT_MS);
+    const result = await runSqlQuery(sqlText, {}, REQUEST_TIMEOUT_MS, req);
     const durationMs = Date.now() - startedAt;
     logStructured("info", {
       route: "/api/bi/query",
@@ -366,6 +488,7 @@ app.post("/api/bi/query", requireApiKey, async (req, res) => {
       rows: result.recordset.length,
       status: "success",
       view,
+      pool: getPoolStats(),
     });
     return res.json({
       success: true,
@@ -381,7 +504,7 @@ app.post("/api/bi/query", requireApiKey, async (req, res) => {
     });
   } catch (error) {
     const durationMs = Date.now() - startedAt;
-    const classified = classifySqlError(error);
+    const classified = classifyAppError(error, req, REQUEST_TIMEOUT_MS);
     logStructured("error", {
       route: "/api/bi/query",
       request_id: requestId,
@@ -392,6 +515,7 @@ app.post("/api/bi/query", requireApiKey, async (req, res) => {
       error_code: classified.code,
       sql_error_number: classified.number,
       message: classified.message,
+      pool: getPoolStats(),
     });
     return sendError(res, {
       httpStatus: classified.httpStatus,
@@ -412,6 +536,8 @@ app.post("/query", requireApiKey, async (req, res) => {
   const { sql: sqlText, params = {}, timeoutMs } = req.body || {};
   const { requestId, traceId, queryName, startedAt } = getContext(req, "query");
   const effectiveTimeoutMs = Math.min(Math.max(Number(timeoutMs) || REQUEST_TIMEOUT_MS, 1000), 600000);
+  const cacheEnabled = shouldCacheQuery(sqlText, queryName);
+  const cacheKey = cacheEnabled ? buildQueryCacheKey(sqlText, params, queryName) : null;
 
   if (!isSqlAllowed(sqlText)) {
     return sendError(res, {
@@ -424,11 +550,40 @@ app.post("/query", requireApiKey, async (req, res) => {
       queryName,
       durationMs: Date.now() - startedAt,
       upstreamTimeoutMs: effectiveTimeoutMs,
+      metaExtras: { cache: "bypass" },
     });
   }
 
   try {
-    const result = await runSqlQuery(sqlText, params, effectiveTimeoutMs);
+    let result;
+    let cacheStatus = "bypass";
+    if (cacheEnabled) {
+      const cachedResult = queryCache.get(cacheKey);
+      if (cachedResult) {
+        result = cachedResult;
+        cacheStatus = "hit";
+      } else {
+        cacheStatus = "miss";
+      }
+    }
+
+    if (!result) {
+      result = await queryLimiter(async () => {
+        if (req.aborted) {
+          const abortError = new Error("Request aborted by client");
+          abortError.code = "ECONNRESET";
+          throw abortError;
+        }
+        return runSqlQuery(sqlText, params, effectiveTimeoutMs, req);
+      });
+      if (cacheEnabled) {
+        queryCache.set(cacheKey, {
+          recordset: result.recordset,
+          rowsAffected: result.rowsAffected,
+        });
+      }
+    }
+
     const durationMs = Date.now() - startedAt;
     logStructured("info", {
       route: "/query",
@@ -438,6 +593,9 @@ app.post("/query", requireApiKey, async (req, res) => {
       duration_ms: durationMs,
       rows: result.recordset.length,
       status: "success",
+      cache: cacheStatus,
+      pool: getPoolStats(),
+      limiter: getLimiterStats(),
     });
     return res.status(200).json({
       success: true,
@@ -449,11 +607,13 @@ app.post("/query", requireApiKey, async (req, res) => {
         trace_id: traceId,
         query_name: queryName,
         upstream_timeout_ms: effectiveTimeoutMs,
+        cache: cacheStatus,
       },
     });
   } catch (error) {
     const durationMs = Date.now() - startedAt;
-    const classified = classifySqlError(error);
+    const classified = classifyAppError(error, req, effectiveTimeoutMs);
+    const cacheStatus = getCacheStatus(cacheEnabled, false);
     logStructured("error", {
       route: "/query",
       request_id: requestId,
@@ -465,6 +625,9 @@ app.post("/query", requireApiKey, async (req, res) => {
       error_code: classified.code,
       sql_error_number: classified.number,
       message: classified.message,
+      cache: cacheStatus,
+      pool: getPoolStats(),
+      limiter: getLimiterStats(),
     });
     return sendError(res, {
       httpStatus: classified.httpStatus,
@@ -477,6 +640,7 @@ app.post("/query", requireApiKey, async (req, res) => {
       durationMs,
       upstreamTimeoutMs: effectiveTimeoutMs,
       sqlErrorNumber: classified.number,
+      metaExtras: { cache: cacheStatus },
     });
   }
 });
@@ -504,6 +668,7 @@ app.post("/refresh/renovacoes-inadimplencia", requireApiKey, async (req, res) =>
       "EXEC dbo.sp_refresh_renovacoes_inadimplencia @Janelas = @Janelas",
       { Janelas: windows.join(",") },
       REFRESH_TIMEOUT_MS,
+      req,
     );
 
     const latestLog = await queryLatestRefreshLog();
@@ -526,6 +691,7 @@ app.post("/refresh/renovacoes-inadimplencia", requireApiKey, async (req, res) =>
       windows: windows.join(","),
       log_id: logId,
       status: "success",
+      pool: getPoolStats(),
     });
 
     return res.status(200).json({
@@ -544,7 +710,7 @@ app.post("/refresh/renovacoes-inadimplencia", requireApiKey, async (req, res) =>
     });
   } catch (error) {
     const durationMs = Date.now() - startedAt;
-    const classified = classifySqlError(error);
+    const classified = classifyAppError(error, req, REFRESH_TIMEOUT_MS);
     logStructured("error", {
       route: "/refresh/renovacoes-inadimplencia",
       request_id: requestId,
@@ -558,6 +724,7 @@ app.post("/refresh/renovacoes-inadimplencia", requireApiKey, async (req, res) =>
       error_code: classified.code,
       sql_error_number: classified.number,
       message: classified.message,
+      pool: getPoolStats(),
     });
     return sendError(res, {
       httpStatus: classified.httpStatus,
