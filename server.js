@@ -1,28 +1,14 @@
 /**
- * SQL Server Bridge — HTTP API segura para consumo por Supabase Edge Functions
- *
- * v1.1.0 — Streaming + hard limit anti-OOM (Railway free tier 512MB)
+ * SQL Server Bridge - HTTP API segura para consumo por Supabase Edge Functions.
  *
  * Endpoints:
- *   GET  /health             → status + ping no banco
- *   POST /api/bi/query       → executa SELECT em view permitida (legado bi-query)
- *   POST /query              → executa SQL vindo da edge sqlserver-query
- *                              (streaming + hard limit de linhas)
+ *   GET  /health
+ *   POST /api/bi/query
+ *   POST /query
+ *   POST /refresh/renovacoes-inadimplencia
  *
- * Autenticação: Header x-api-key: <BRIDGE_API_KEY>
- * Override de limite: Header x-allow-large: 1  (uso pontual, com cuidado)
- *
- * Variáveis de ambiente (.env):
- *   PORT=3000
- *   BRIDGE_API_KEY=<chave-forte-aleatoria>
- *   HARD_LIMIT_ROWS=100000        ← NOVO: corta query antes de OOM
- *   SQLSERVER_HOST=<host>
- *   SQLSERVER_PORT=1433
- *   SQLSERVER_DB=<database>
- *   SQLSERVER_USER=<user>
- *   SQLSERVER_PASSWORD=<password>
- *   SQLSERVER_ENCRYPT=true
- *   SQLSERVER_TRUST_CERT=true
+ * Autenticacao:
+ *   Header: x-api-key: <BRIDGE_API_KEY>
  */
 
 require("dotenv").config();
@@ -32,10 +18,18 @@ const sql = require("mssql");
 
 const PORT = parseInt(process.env.PORT || "3000", 10);
 const API_KEY = process.env.BRIDGE_API_KEY;
-const HARD_LIMIT_ROWS = parseInt(process.env.HARD_LIMIT_ROWS || "100000", 10);
+const REQUEST_TIMEOUT_MS = Math.min(
+  Math.max(parseInt(process.env.SQLSERVER_REQUEST_TIMEOUT_MS || "60000", 10), 1000),
+  600000,
+);
+const REFRESH_TIMEOUT_MS = Math.min(
+  Math.max(parseInt(process.env.SQLSERVER_REFRESH_TIMEOUT_MS || "600000", 10), 1000),
+  600000,
+);
+const BRIDGE_NAME = "sqlserver-bridge";
 
 if (!API_KEY) {
-  console.error("[FATAL] BRIDGE_API_KEY não configurado no .env");
+  console.error("[FATAL] BRIDGE_API_KEY nao configurado no .env");
   process.exit(1);
 }
 
@@ -52,236 +46,506 @@ const sqlConfig = {
     enableArithAbort: true,
   },
   connectionTimeout: 30000,
-  requestTimeout: 180000,
+  requestTimeout: REQUEST_TIMEOUT_MS,
 };
 
 let pool;
 async function getPool() {
   if (!pool) {
     pool = await sql.connect(sqlConfig);
-    console.log("[DB] Pool SQL Server conectado");
+    logStructured("info", {
+      route: "startup",
+      status: "connected",
+      message: "SQL Server pool conectado",
+    });
   }
   return pool;
 }
 
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+function nowIso() {
+  return new Date().toISOString();
+}
 
-// ───────────────────────────────────────────────
-// Auth
-// ───────────────────────────────────────────────
+function getRequestId(req) {
+  return String(req.header("x-request-id") || cryptoRandom()).trim();
+}
+
+function getTraceId(req, requestId) {
+  return String(req.header("x-trace-id") || requestId || cryptoRandom()).trim();
+}
+
+function getQueryName(req, fallback) {
+  return String(req.header("x-query-name") || fallback || "unknown").trim();
+}
+
+function cryptoRandom() {
+  return `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function logStructured(level, payload) {
+  const entry = {
+    timestamp: nowIso(),
+    level,
+    service: BRIDGE_NAME,
+    ...payload,
+  };
+  const line = JSON.stringify(entry);
+  if (level === "error") {
+    console.error(line);
+    return;
+  }
+  console.log(line);
+}
+
+function parseWindows(input) {
+  const raw = Array.isArray(input) ? input.join(",") : String(input || "90,180,365");
+  const values = raw
+    .split(",")
+    .map((value) => parseInt(String(value).trim(), 10))
+    .filter((value) => Number.isFinite(value))
+    .filter((value) => value >= 30 && value <= 365);
+
+  const unique = [...new Set(values)].sort((a, b) => a - b);
+  return unique.length ? unique : null;
+}
+
+function classifySqlError(error) {
+  const message = String(error && error.message ? error.message : "Unknown SQL error");
+  const number = Number.isFinite(Number(error && error.number)) ? Number(error.number) : null;
+  const code = error && error.code ? String(error.code) : "MSSQL_ERROR";
+  const lower = message.toLowerCase();
+
+  if (lower.includes("timeout") || lower.includes("request failed to complete")) {
+    return { httpStatus: 504, retryable: true, code: "SQL_TIMEOUT", number, message };
+  }
+  if (number === 1205 || lower.includes("deadlock")) {
+    return { httpStatus: 503, retryable: true, code: "SQL_DEADLOCK", number, message };
+  }
+  if (number === 1222 || lower.includes("lock request time out")) {
+    return { httpStatus: 503, retryable: true, code: "SQL_LOCK_TIMEOUT", number, message };
+  }
+  if (code === "ETIMEOUT" || code === "ESOCKET" || code === "ECONNCLOSED" || code === "ENOCONN") {
+    return { httpStatus: 503, retryable: true, code: "SQL_TRANSIENT", number, message };
+  }
+  return { httpStatus: 500, retryable: false, code, number, message };
+}
+
+function sendError(res, {
+  httpStatus,
+  code,
+  message,
+  retryable,
+  requestId,
+  traceId,
+  queryName,
+  durationMs,
+  upstreamTimeoutMs,
+  sqlErrorNumber = null,
+}) {
+  return res.status(httpStatus).json({
+    success: false,
+    error: {
+      code,
+      message,
+      retryable,
+      number: sqlErrorNumber,
+    },
+    meta: {
+      request_id: requestId,
+      trace_id: traceId,
+      query_name: queryName,
+      duration_ms: durationMs,
+      upstream_timeout_ms: upstreamTimeoutMs,
+    },
+  });
+}
+
 function requireApiKey(req, res, next) {
   const key = req.header("x-api-key");
   if (!key || key !== API_KEY) {
-    return res.status(401).json({ error: "UNAUTHORIZED" });
+    return res.status(401).json({
+      success: false,
+      error: {
+        code: "UNAUTHORIZED",
+        message: "x-api-key invalido",
+        retryable: false,
+      },
+      meta: {
+        request_id: getRequestId(req),
+        trace_id: getTraceId(req),
+        query_name: getQueryName(req, "auth"),
+        duration_ms: 0,
+      },
+    });
   }
   next();
 }
 
-// ───────────────────────────────────────────────
-// Whitelist legada (rota /api/bi/query)
-// ───────────────────────────────────────────────
 const ALLOWED_PREFIXES = ["vw_", "v_bi_", "v_gold_"];
 const MAX_LIMIT = 5000;
 
 function isViewAllowed(viewName) {
   if (typeof viewName !== "string") return false;
   if (!/^[A-Za-z0-9_]{1,128}$/.test(viewName)) return false;
-  return ALLOWED_PREFIXES.some((p) => viewName.startsWith(p));
+  return ALLOWED_PREFIXES.some((prefix) => viewName.startsWith(prefix));
 }
 
-// ───────────────────────────────────────────────
-// Validação SQL — só SELECT/WITH
-// ───────────────────────────────────────────────
-const FORBIDDEN_TOKENS = [
-  /\bINSERT\b/i, /\bUPDATE\b/i, /\bDELETE\b/i, /\bDROP\b/i,
-  /\bALTER\b/i, /\bTRUNCATE\b/i, /\bCREATE\b/i, /\bEXEC\b/i,
-  /\bEXECUTE\b/i, /\bMERGE\b/i, /\bGRANT\b/i, /\bREVOKE\b/i,
-  /;\s*\w/,
-];
-
-function isSqlReadOnly(rawSql) {
-  if (typeof rawSql !== "string") return false;
-  const trimmed = rawSql.trim().replace(/;+\s*$/, "");
-  if (!trimmed) return false;
-  if (!/^(SELECT|WITH)\b/i.test(trimmed)) return false;
-  return !FORBIDDEN_TOKENS.some((re) => re.test(trimmed));
+function isSqlAllowed(sqlText) {
+  return typeof sqlText === "string" && /^\s*(WITH|SELECT|EXEC)\b/i.test(sqlText);
 }
 
-// ───────────────────────────────────────────────
-// Health
-// ───────────────────────────────────────────────
+async function runSqlQuery(sqlText, params, timeoutMs) {
+  const activePool = await getPool();
+  const request = activePool.request();
+  request.timeout = timeoutMs;
+  for (const [key, value] of Object.entries(params || {})) {
+    request.input(key, value);
+  }
+  return request.query(sqlText);
+}
+
+async function queryLatestRefreshLog() {
+  const activePool = await getPool();
+  const result = await activePool.request().query(`
+    SELECT TOP 1
+      Id,
+      StartedAt,
+      FinishedAt,
+      DurationMs,
+      RowsAggregate,
+      RowsItens,
+      Janelas,
+      Status
+    FROM dbo.bi_refresh_log
+    WHERE Job = 'sp_refresh_renovacoes_inadimplencia'
+    ORDER BY Id DESC
+  `);
+  return result.recordset[0] || null;
+}
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "256kb" }));
+
 app.get("/health", async (_req, res) => {
   try {
-    const p = await getPool();
-    const r = await p.request().query("SELECT 1 AS ok");
-    res.json({ status: "ok", db: r.recordset[0].ok === 1, hard_limit_rows: HARD_LIMIT_ROWS });
-  } catch (err) {
-    res.status(500).json({ status: "error", error: err.message });
+    const activePool = await getPool();
+    const result = await activePool.request().query("SELECT 1 AS ok");
+    res.json({ status: "ok", db: result.recordset[0].ok === 1 });
+  } catch (error) {
+    res.status(500).json({
+      status: "error",
+      error: error.message,
+    });
   }
 });
 
-// ───────────────────────────────────────────────
-// Rota legada /api/bi/query (mantida)
-// ───────────────────────────────────────────────
 app.post("/api/bi/query", requireApiKey, async (req, res) => {
   const { view, limit } = req.body || {};
-  if (!isViewAllowed(view)) return res.status(403).json({ error: "VIEW_NOT_ALLOWED", view });
+  const requestId = getRequestId(req);
+  const traceId = getTraceId(req, requestId);
+  const queryName = getQueryName(req, "api_bi_query");
+  const startedAt = Date.now();
+
+  if (!isViewAllowed(view)) {
+    return sendError(res, {
+      httpStatus: 400,
+      code: "VIEW_NOT_ALLOWED",
+      message: `View nao permitida: ${String(view || "")}`,
+      retryable: false,
+      requestId,
+      traceId,
+      queryName,
+      durationMs: Date.now() - startedAt,
+      upstreamTimeoutMs: REQUEST_TIMEOUT_MS,
+    });
+  }
 
   const safeLimit = Math.min(Math.max(parseInt(limit, 10) || 1000, 1), MAX_LIMIT);
 
   try {
-    const p = await getPool();
-    const query = `SELECT TOP (${safeLimit}) * FROM [${view}]`;
-    const start = Date.now();
-    const result = await p.request().query(query);
-    const duration = Date.now() - start;
-
-    console.log(`[QUERY] view=${view} rows=${result.recordset.length} duration=${duration}ms`);
-
-    res.json({
+    const sqlText = `SELECT TOP (${safeLimit}) * FROM [${view}]`;
+    const result = await runSqlQuery(sqlText, {}, REQUEST_TIMEOUT_MS);
+    const durationMs = Date.now() - startedAt;
+    logStructured("info", {
+      route: "/api/bi/query",
+      request_id: requestId,
+      trace_id: traceId,
+      query_name: queryName,
+      duration_ms: durationMs,
+      rows: result.recordset.length,
+      status: "success",
+      view,
+    });
+    return res.json({
       success: true,
       view,
       data: result.recordset,
-      meta: { count: result.recordset.length, duration_ms: duration },
+      meta: {
+        count: result.recordset.length,
+        duration_ms: durationMs,
+        request_id: requestId,
+        trace_id: traceId,
+        query_name: queryName,
+      },
     });
-  } catch (err) {
-    console.error(`[ERROR] view=${view}`, err.message);
-    res.status(500).json({ error: "QUERY_FAILED", message: err.message });
+  } catch (error) {
+    const durationMs = Date.now() - startedAt;
+    const classified = classifySqlError(error);
+    logStructured("error", {
+      route: "/api/bi/query",
+      request_id: requestId,
+      trace_id: traceId,
+      query_name: queryName,
+      duration_ms: durationMs,
+      status: "error",
+      error_code: classified.code,
+      sql_error_number: classified.number,
+      message: classified.message,
+    });
+    return sendError(res, {
+      httpStatus: classified.httpStatus,
+      code: classified.code,
+      message: classified.message,
+      retryable: classified.retryable,
+      requestId,
+      traceId,
+      queryName,
+      durationMs,
+      upstreamTimeoutMs: REQUEST_TIMEOUT_MS,
+      sqlErrorNumber: classified.number,
+    });
   }
 });
 
-// ───────────────────────────────────────────────
-// /query — STREAMING (anti-OOM)
-//
-// Em vez de carregar o recordset inteiro em memória e fazer res.json(),
-// escrevemos cada linha direto no socket usando request.stream = true.
-// Isso mantém o uso de memória ~constante (~30-50MB) mesmo com 100k linhas.
-//
-// Hard limit: aborta a query se passar de HARD_LIMIT_ROWS (default 100k).
-// Override: header x-allow-large: 1 (uso pontual).
-// ───────────────────────────────────────────────
 app.post("/query", requireApiKey, async (req, res) => {
-  const { sql: rawSql, params, source, queryName } = req.body || {};
-  const allowLarge = req.header("x-allow-large") === "1";
-  const rowCap = allowLarge ? Number.MAX_SAFE_INTEGER : HARD_LIMIT_ROWS;
+  const { sql: sqlText, params = {}, timeoutMs } = req.body || {};
+  const requestId = getRequestId(req);
+  const traceId = getTraceId(req, requestId);
+  const queryName = getQueryName(req, "query");
+  const startedAt = Date.now();
+  const effectiveTimeoutMs = Math.min(Math.max(Number(timeoutMs) || REQUEST_TIMEOUT_MS, 1000), 600000);
 
-  if (!rawSql || typeof rawSql !== "string") return res.status(400).json({ error: "MISSING_SQL" });
-  if (rawSql.length > 20000) return res.status(413).json({ error: "SQL_TOO_LARGE" });
-  if (!isSqlReadOnly(rawSql)) {
-    return res.status(403).json({ error: "SQL_NOT_ALLOWED", message: "Apenas SELECT/WITH são permitidos." });
+  if (!isSqlAllowed(sqlText)) {
+    return sendError(res, {
+      httpStatus: 400,
+      code: "INVALID_SQL",
+      message: "Only SELECT/WITH/EXEC allowed",
+      retryable: false,
+      requestId,
+      traceId,
+      queryName,
+      durationMs: Date.now() - startedAt,
+      upstreamTimeoutMs: effectiveTimeoutMs,
+    });
   }
-
-  let pool;
-  try {
-    pool = await getPool();
-  } catch (err) {
-    return res.status(500).json({ error: "DB_CONNECT_FAILED", message: err.message });
-  }
-
-  const request = pool.request();
-  request.stream = true; // ⭐ chave do streaming
-
-  // Bind de parâmetros nomeados (@nome)
-  if (params && typeof params === "object") {
-    for (const [key, value] of Object.entries(params)) {
-      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
-        return res.status(400).json({ error: "INVALID_PARAM_NAME", param: key });
-      }
-      request.input(key, value);
-    }
-  }
-
-  const start = Date.now();
-  let rowCount = 0;
-  let aborted = false;
-  let firstRow = true;
-  let responded = false;
-
-  // Inicia resposta JSON em streaming manualmente
-  res.setHeader("Content-Type", "application/json");
-  res.setHeader("Transfer-Encoding", "chunked");
-  res.write('{"success":true,"data":[');
-
-  request.on("row", (row) => {
-    if (aborted) return;
-
-    if (rowCount >= rowCap) {
-      aborted = true;
-      console.warn(`[/query] ROW_LIMIT atingido (${rowCap}) source=${source} name=${queryName} — abortando`);
-      try { request.cancel(); } catch (_) { /* noop */ }
-      return;
-    }
-
-    try {
-      const prefix = firstRow ? "" : ",";
-      res.write(prefix + JSON.stringify(row));
-      firstRow = false;
-      rowCount++;
-    } catch (err) {
-      console.error("[/query] erro ao serializar row:", err.message);
-      aborted = true;
-      try { request.cancel(); } catch (_) { /* noop */ }
-    }
-  });
-
-  request.on("error", (err) => {
-    if (responded) return;
-    responded = true;
-    const duration = Date.now() - start;
-    console.error(
-      `[/query ERROR] source=${source || "?"} name=${queryName || "?"} rows=${rowCount} duration=${duration}ms`,
-      err.message,
-    );
-    // Como já começamos a escrever, fecha o JSON com flag de erro nos meta
-    try {
-      res.write(`],"success":false,"meta":{"count":${rowCount},"duration_ms":${duration},"error":${JSON.stringify(err.message)}}}`);
-      res.end();
-    } catch (_) {
-      try { res.end(); } catch (_e) { /* noop */ }
-    }
-  });
-
-  request.on("done", () => {
-    if (responded) return;
-    responded = true;
-    const duration = Date.now() - start;
-    console.log(
-      `[/query] source=${source || "?"} name=${queryName || "?"} rows=${rowCount} duration=${duration}ms ${aborted ? "[CAPPED]" : ""}`,
-    );
-    res.write(
-      `],"meta":{"count":${rowCount},"duration_ms":${duration},"source":${JSON.stringify(source || null)},"queryName":${JSON.stringify(queryName || null)}${aborted ? `,"truncated":true,"row_cap":${rowCap}` : ""}}}`,
-    );
-    res.end();
-  });
-
-  // Cliente cancelou (timeout do edge etc.) — aborta a query
-  req.on("close", () => {
-    if (!responded) {
-      aborted = true;
-      try { request.cancel(); } catch (_) { /* noop */ }
-    }
-  });
 
   try {
-    request.query(rawSql);
-  } catch (err) {
-    if (responded) return;
-    responded = true;
-    console.error(`[/query SYNC ERROR] ${err.message}`);
-    try {
-      res.write(`],"meta":{"count":0,"error":${JSON.stringify(err.message)}}}`);
-      res.end();
-    } catch (_) { try { res.end(); } catch (_e) { /* noop */ } }
+    const result = await runSqlQuery(sqlText, params, effectiveTimeoutMs);
+    const durationMs = Date.now() - startedAt;
+    logStructured("info", {
+      route: "/query",
+      request_id: requestId,
+      trace_id: traceId,
+      query_name: queryName,
+      duration_ms: durationMs,
+      rows: result.recordset.length,
+      status: "success",
+    });
+    return res.status(200).json({
+      success: true,
+      rows: result.recordset,
+      meta: {
+        rowsAffected: result.rowsAffected,
+        duration_ms: durationMs,
+        request_id: requestId,
+        trace_id: traceId,
+        query_name: queryName,
+        upstream_timeout_ms: effectiveTimeoutMs,
+      },
+    });
+  } catch (error) {
+    const durationMs = Date.now() - startedAt;
+    const classified = classifySqlError(error);
+    logStructured("error", {
+      route: "/query",
+      request_id: requestId,
+      trace_id: traceId,
+      query_name: queryName,
+      duration_ms: durationMs,
+      rows: 0,
+      status: "error",
+      error_code: classified.code,
+      sql_error_number: classified.number,
+      message: classified.message,
+    });
+    return sendError(res, {
+      httpStatus: classified.httpStatus,
+      code: classified.code,
+      message: classified.message,
+      retryable: classified.retryable,
+      requestId,
+      traceId,
+      queryName,
+      durationMs,
+      upstreamTimeoutMs: effectiveTimeoutMs,
+      sqlErrorNumber: classified.number,
+    });
   }
 });
 
-// ───────────────────────────────────────────────
-// Start + graceful shutdown
-// ───────────────────────────────────────────────
+app.post("/refresh/renovacoes-inadimplencia", requireApiKey, async (req, res) => {
+  const requestId = getRequestId(req);
+  const traceId = getTraceId(req, requestId);
+  const queryName = getQueryName(req, "refresh_renovacoes_inadimplencia");
+  const startedAt = Date.now();
+  const windows = parseWindows(req.body && (req.body.windows || req.body.janelas));
+
+  if (!windows) {
+    return sendError(res, {
+      httpStatus: 400,
+      code: "INVALID_WINDOWS",
+      message: "Informe janelas validas entre 30 e 365 dias",
+      retryable: false,
+      requestId,
+      traceId,
+      queryName,
+      durationMs: Date.now() - startedAt,
+      upstreamTimeoutMs: REFRESH_TIMEOUT_MS,
+    });
+  }
+
+  try {
+    await runSqlQuery(
+      "EXEC dbo.sp_refresh_renovacoes_inadimplencia @Janelas = @Janelas",
+      { Janelas: windows.join(",") },
+      REFRESH_TIMEOUT_MS,
+    );
+
+    const latestLog = await queryLatestRefreshLog();
+    const durationMs = Date.now() - startedAt;
+    const refreshAt = latestLog && latestLog.FinishedAt
+      ? new Date(latestLog.FinishedAt).toISOString()
+      : nowIso();
+    const rowsAggregate = Number(latestLog && latestLog.RowsAggregate ? latestLog.RowsAggregate : 0);
+    const rowsItems = Number(latestLog && latestLog.RowsItens ? latestLog.RowsItens : 0);
+    const logId = latestLog && latestLog.Id ? Number(latestLog.Id) : null;
+
+    logStructured("info", {
+      route: "/refresh/renovacoes-inadimplencia",
+      request_id: requestId,
+      trace_id: traceId,
+      query_name: queryName,
+      duration_ms: durationMs,
+      rows_aggregate: rowsAggregate,
+      rows_items: rowsItems,
+      windows: windows.join(","),
+      log_id: logId,
+      status: "success",
+    });
+
+    return res.status(200).json({
+      success: true,
+      rows_aggregate: rowsAggregate,
+      rows_items: rowsItems,
+      refresh_at: refreshAt,
+      duration_ms: durationMs,
+      log_id: logId,
+      windows: windows.join(","),
+      request_id: requestId,
+      trace_id: traceId,
+      retryable: false,
+      query_name: queryName,
+      upstream_timeout_ms: REFRESH_TIMEOUT_MS,
+    });
+  } catch (error) {
+    const durationMs = Date.now() - startedAt;
+    const classified = classifySqlError(error);
+    logStructured("error", {
+      route: "/refresh/renovacoes-inadimplencia",
+      request_id: requestId,
+      trace_id: traceId,
+      query_name: queryName,
+      duration_ms: durationMs,
+      rows_aggregate: 0,
+      rows_items: 0,
+      windows: windows.join(","),
+      status: "error",
+      error_code: classified.code,
+      sql_error_number: classified.number,
+      message: classified.message,
+    });
+    return sendError(res, {
+      httpStatus: classified.httpStatus,
+      code: classified.code,
+      message: classified.message,
+      retryable: classified.retryable,
+      requestId,
+      traceId,
+      queryName,
+      durationMs,
+      upstreamTimeoutMs: REFRESH_TIMEOUT_MS,
+      sqlErrorNumber: classified.number,
+    });
+  }
+});
+
+app.use((req, res) => {
+  const requestId = getRequestId(req);
+  const traceId = getTraceId(req, requestId);
+  const queryName = getQueryName(req, "not_found");
+  return res.status(404).json({
+    success: false,
+    error: {
+      code: "NOT_FOUND",
+      message: `Cannot ${req.method} ${req.path}`,
+      retryable: false,
+    },
+    meta: {
+      request_id: requestId,
+      trace_id: traceId,
+      query_name: queryName,
+      duration_ms: 0,
+    },
+  });
+});
+
+app.use((error, req, res, _next) => {
+  const requestId = getRequestId(req);
+  const traceId = getTraceId(req, requestId);
+  const queryName = getQueryName(req, "express_error");
+  const classified = classifySqlError(error);
+  logStructured("error", {
+    route: req.path,
+    request_id: requestId,
+    trace_id: traceId,
+    query_name: queryName,
+    duration_ms: 0,
+    status: "error",
+    error_code: classified.code,
+    sql_error_number: classified.number,
+    message: classified.message,
+  });
+  return sendError(res, {
+    httpStatus: classified.httpStatus,
+    code: classified.code,
+    message: classified.message,
+    retryable: classified.retryable,
+    requestId,
+    traceId,
+    queryName,
+    durationMs: 0,
+    upstreamTimeoutMs: REQUEST_TIMEOUT_MS,
+    sqlErrorNumber: classified.number,
+  });
+});
+
 app.listen(PORT, () => {
-  console.log(`[SERVER] SQL Server Bridge v1.1.0 rodando na porta ${PORT} (HARD_LIMIT_ROWS=${HARD_LIMIT_ROWS})`);
+  logStructured("info", {
+    route: "startup",
+    status: "listening",
+    port: PORT,
+  });
 });
 
 process.on("SIGTERM", async () => {
