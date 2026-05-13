@@ -8,7 +8,7 @@
  *   POST /refresh/renovacoes-inadimplencia
  *
  * Autenticacao:
- *   Header: x-api-key: <r5403zmeyqri80ueu77lpht4ircchcnf>
+ *   Header: x-api-key: <BRIDGE_API_KEY>
  */
 
 require("dotenv").config();
@@ -622,6 +622,13 @@ app.post("/query", requireApiKey, async (req, res) => {
           abortError.code = "ECONNRESET";
           throw abortError;
         }
+        console.log(
+          "[query:execute]",
+          queryName,
+          requestId,
+          queryLimiter.activeCount,
+          queryLimiter.pendingCount,
+        );
         return runSqlQuery(sqlText, params, effectiveTimeoutMs, req);
       });
       if (cacheEnabled) {
