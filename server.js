@@ -12,6 +12,7 @@
  */
 
 require("dotenv").config();
+const { AsyncLocalStorage } = require("async_hooks");
 const express = require("express");
 const cors = require("cors");
 const sql = require("mssql");
@@ -67,6 +68,7 @@ const sqlConfig = {
 let pool;
 let server;
 let shuttingDown = false;
+const requestContextStorage = new AsyncLocalStorage();
 const queryLimiter = pLimit(SQLSERVER_QUERY_CONCURRENCY);
 const queryCache = new NodeCache({
   stdTTL: SQLSERVER_QUERY_CACHE_TTL_SECONDS,
@@ -145,6 +147,10 @@ function durationSince(startedAt) {
   return Math.max(Date.now() - Number(startedAt || Date.now()), 0);
 }
 
+function getAsyncContext() {
+  return requestContextStorage.getStore() || null;
+}
+
 function getPoolStats() {
   const stats = {
     configured_max: SQLSERVER_POOL_MAX,
@@ -180,6 +186,24 @@ function getStartupConfig() {
     sqlserver_query_concurrency: SQLSERVER_QUERY_CONCURRENCY,
     sqlserver_query_cache_ttl_seconds: SQLSERVER_QUERY_CACHE_TTL_SECONDS,
     sqlserver_query_cache_max_keys: SQLSERVER_QUERY_CACHE_MAX_KEYS,
+  };
+}
+
+function buildOperationalLogFields(route, queryName, durationMs, cacheStatus) {
+  const poolStats = getPoolStats();
+  const limiterStats = getLimiterStats();
+  return {
+    route,
+    query_name: queryName,
+    duration_ms: durationMs,
+    cache: cacheStatus,
+    limiter: limiterStats,
+    pool: poolStats,
+    "limiter.active": limiterStats.active,
+    "limiter.pending": limiterStats.pending,
+    "pool.connected": poolStats.connected,
+    "pool.configured_max": poolStats.configured_max,
+    "pool.configured_min": poolStats.configured_min,
   };
 }
 
@@ -409,20 +433,29 @@ const app = express();
 app.use(cors());
 app.use((req, res, next) => {
   const ctx = attachRequestContext(req, "request");
-  req.on("aborted", () => {
-    logStructured("error", {
-      route: req.path,
-      request_id: ctx.requestId,
-      trace_id: ctx.traceId,
-      query_name: ctx.queryName,
-      duration_ms: durationSince(ctx.startedAt),
-      status: "aborted",
-      error_code: "REQUEST_ABORTED",
-      error_class: "operational",
-      message: "Client aborted request",
+  const asyncContext = {
+    route: req.path,
+    requestId: ctx.requestId,
+    traceId: ctx.traceId,
+    queryName: ctx.queryName,
+    startedAt: ctx.startedAt,
+  };
+  return requestContextStorage.run(asyncContext, () => {
+    req.on("aborted", () => {
+      logStructured("error", {
+        route: req.path,
+        request_id: ctx.requestId,
+        trace_id: ctx.traceId,
+        query_name: ctx.queryName,
+        duration_ms: durationSince(ctx.startedAt),
+        status: "aborted",
+        error_code: "REQUEST_ABORTED",
+        error_class: "operational",
+        message: "Client aborted request",
+      });
     });
+    next();
   });
-  next();
 });
 app.use(express.json({ limit: "256kb" }));
 app.use((error, req, res, next) => {
@@ -571,6 +604,7 @@ app.post("/query", requireApiKey, async (req, res) => {
   try {
     let result;
     let cacheStatus = "bypass";
+    console.log("[query:start]", queryName, requestId);
     if (cacheEnabled) {
       const cachedResult = queryCache.get(cacheKey);
       if (cachedResult) {
@@ -628,27 +662,17 @@ app.post("/query", requireApiKey, async (req, res) => {
     const durationMs = Date.now() - startedAt;
     const classified = classifyAppError(error, req, effectiveTimeoutMs);
     const cacheStatus = getCacheStatus(cacheEnabled, false);
-    const poolStats = getPoolStats();
-    const limiterStats = getLimiterStats();
+    const operationalFields = buildOperationalLogFields("/query", queryName, durationMs, cacheStatus);
+    console.log("[query:error]", queryName, requestId, durationMs, classified.code);
     logStructured("error", {
-      route: "/query",
       request_id: requestId,
       trace_id: traceId,
-      query_name: queryName,
-      duration_ms: durationMs,
       rows: 0,
       status: "error",
       error_code: classified.code,
       sql_error_number: classified.number,
       message: classified.message,
-      cache: cacheStatus,
-      pool: poolStats,
-      limiter: limiterStats,
-      "limiter.active": limiterStats.active,
-      "limiter.pending": limiterStats.pending,
-      "pool.connected": poolStats.connected,
-      "pool.configured_max": poolStats.configured_max,
-      "pool.configured_min": poolStats.configured_min,
+      ...operationalFields,
     });
     return sendError(res, {
       httpStatus: classified.httpStatus,
@@ -854,32 +878,49 @@ server = app.listen(PORT, () => {
     port: PORT,
     config: getStartupConfig(),
   });
+  console.log("[startup] sqlserver-bridge listening", JSON.stringify(getStartupConfig()));
 });
 
 process.on("unhandledRejection", (reason) => {
   const error = reason instanceof Error ? reason : new Error(String(reason));
   const classified = classifyAppError(error, null, REQUEST_TIMEOUT_MS);
+  const asyncContext = getAsyncContext();
+  const durationMs = asyncContext ? durationSince(asyncContext.startedAt) : 0;
+  const route = asyncContext && asyncContext.route ? asyncContext.route : "process";
+  const queryName = asyncContext && asyncContext.queryName ? asyncContext.queryName : "unknown";
+  const operationalFields = buildOperationalLogFields(route, queryName, durationMs, "bypass");
   logStructured("error", {
-    route: "process",
+    route,
     status: "error",
     error_code: classified.code,
     error_class: "fatal",
     sql_error_number: classified.number,
     message: classified.message,
     event: "unhandledRejection",
+    request_id: asyncContext ? asyncContext.requestId : undefined,
+    trace_id: asyncContext ? asyncContext.traceId : undefined,
+    ...operationalFields,
   });
 });
 
 process.on("uncaughtException", (error) => {
   const classified = classifyAppError(error, null, REQUEST_TIMEOUT_MS);
+  const asyncContext = getAsyncContext();
+  const durationMs = asyncContext ? durationSince(asyncContext.startedAt) : 0;
+  const route = asyncContext && asyncContext.route ? asyncContext.route : "process";
+  const queryName = asyncContext && asyncContext.queryName ? asyncContext.queryName : "unknown";
+  const operationalFields = buildOperationalLogFields(route, queryName, durationMs, "bypass");
   logStructured("error", {
-    route: "process",
+    route,
     status: "error",
     error_code: classified.code,
     error_class: "fatal",
     sql_error_number: classified.number,
     message: classified.message,
     event: "uncaughtException",
+    request_id: asyncContext ? asyncContext.requestId : undefined,
+    trace_id: asyncContext ? asyncContext.traceId : undefined,
+    ...operationalFields,
   });
 });
 
