@@ -962,16 +962,3 @@ process.on("SIGTERM", () => {
 process.on("SIGINT", () => {
   void gracefulShutdown("SIGINT");
 });
-
-    trace_id: asyncContext ? asyncContext.traceId : undefined,
-    ...operationalFields,
-  });
-});
-
-process.on("SIGTERM", () => {
-  void gracefulShutdown("SIGTERM");
-});
-
-process.on("SIGINT", () => {
-  void gracefulShutdown("SIGINT");
-});
